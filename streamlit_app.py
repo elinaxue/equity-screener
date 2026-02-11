@@ -345,7 +345,9 @@ show_cols = [
 # --- column groups ---
 PCT_COLS = [
     "overnight_ret",
-    "residual",      # residual is a % move
+    "residual",      
+    "mom_5d",
+    "mom_20d",
 ]
 
 ZSCORE_COLS = [
@@ -430,16 +432,16 @@ df_tbl = df_view[show_cols].copy()
 fmt = {}
 for c in PCT_COLS:
     if c in df_tbl.columns:
-        fmt[c] = "{:.2%}"          # percent with 2 decimals
+        fmt[c] = "{:.2%}"         
 for c in ZSCORE_COLS:
     if c in df_tbl.columns:
-        fmt[c] = "{:.1f}"          # 1 dp for z-scores
+        fmt[c] = "{:.1f}"         
 for c in RETRACE_COLS:
     if c in df_tbl.columns:
-        fmt[c] = "{:.0%}"          # retracement as whole percent (e.g., 50%)
+        fmt[c] = "{:.0%}"          
 for c in DECIMAL_COLS:
     if c in df_tbl.columns:
-        fmt[c] = "{:.2f}"          # keep decimals
+        fmt[c] = "{:.2f}"         
 
 styled = (
     df_tbl
@@ -447,7 +449,7 @@ styled = (
     .format(fmt, na_rep="—")
 )
 
-# apply column-wise coloring
+# color
 for c in PCT_COLS:
     if c in df_tbl.columns:
         styled = styled.apply(pnl_colormap, subset=[c])
@@ -498,7 +500,7 @@ base = alt.Chart(plot_df).mark_circle(size=70, opacity=0.85).encode(
 x0 = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(strokeWidth=2).encode(x="x:Q")
 y0 = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(strokeWidth=2).encode(y="y:Q")
 
-# quadrant labels (positions are in data coords; tweak if your ranges differ)
+# quadrant labels 
 labels = pd.DataFrame({
     "x": [-2.5,  1.5, -2.5,  1.5],
     "y": [ 0.15, 0.15, -0.15, -0.15],
@@ -520,6 +522,26 @@ st.altair_chart(chart, use_container_width=True)
 # Quick "what lost steam" view: weak momentum + negative residual z
 st.markdown("### Themes losing steam (low momentum + cheap vs beta)")
 losing = df.sort_values(["mom_20d","residual_z"], ascending=[True, True]).head(20)
-st.dataframe(losing[show_cols], use_container_width=True)
+losing_tbl = losing[show_cols].copy()
+
+fmt_losing = {
+    "overnight_ret": "{:.2%}",
+    "residual": "{:.2%}",
+    "retracement": "{:.0%}",
+    "overnight_z": "{:.1f}",
+    "residual_z": "{:.1f}",
+    "sector_residual_z_spread": "{:.1f}",
+    "country_residual_z_spread": "{:.1f}",
+    "mom_5d": "{:.2%}",
+    "mom_20d": "{:.2%}",
+    "beta": "{:.2f}",
+    "px_close": "{:.2f}",
+}
+
+st.dataframe(
+    losing_tbl.style.format(fmt_losing, na_rep="—"),
+    use_container_width=True,
+    hide_index=True
+)
 
 
