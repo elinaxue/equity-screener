@@ -274,6 +274,15 @@ with st.sidebar:
     overnight_thr = st.slider("Z threshold (selloff)", -5.0, -1.0, -2.0, step=0.1)
     retr_min = st.slider("Min retracement (gap fill strength)", 0.0, 2.0, 0.5, step=0.05)
 
+    st.header("Scoring")
+    w1 = st.slider("w1 (retracement weight)", 0.0, 2.0, 0.7, step=0.1)
+    w2 = st.slider("w2 (momentum weight)", 0.0, 2.0, 0.7, step=0.1)
+
+    st.header("Tag thresholds")
+    mkt_driven_z = st.slider("|beta-z| below → Market-driven", 0.0, 2.0, 0.5, step=0.1)
+    idio_z = st.slider("|beta-z| above → Idiosyncratic", 0.5, 4.0, 2.0, step=0.1)
+
+
     st.caption("Tip: add new tickers by editing DEFAULT_UNIVERSES in app.py (or load a YAML/CSV).")
 
 st.subheader(f"{uni_name} (benchmark: {cfg['benchmark']})")
@@ -330,10 +339,78 @@ if only_disloc:
 if only_retrace:
     df_view = df_view[df_view["flag_retracement"]]
 
+# ----------------------------
+# Score + tags (cross-sectional normalization)
+# ----------------------------
+def zscore_cross_section(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    mu = s.mean(skipna=True)
+    sd = s.std(skipna=True)
+    if (sd is None) or (not np.isfinite(sd)) or (sd == 0):
+        return pd.Series(0.0, index=s.index)
+    return (s - mu) / sd
+
+df_view = df_view.copy()
+
+# normalize components (NaN -> 0 so missing doesn't distort Score)
+df_view["retracement_z"] = zscore_cross_section(df_view["retracement"]).fillna(0.0)
+df_view["mom_20d_z"] = zscore_cross_section(df_view["mom_20d"]).fillna(0.0)
+
+# Composite score (higher = better dip-buy setup)
+df_view["score"] = (-df_view["residual_z"]) + (w1 * df_view["retracement_z"]) + (w2 * df_view["mom_20d_z"])
+
+# Tag: market-driven vs idiosyncratic
+abs_z = df_view["residual_z"].abs()
+df_view["shock_tag"] = np.select(
+    [
+        abs_z < mkt_driven_z,
+        abs_z >= idio_z,
+    ],
+    [
+        "Market-driven",
+        "Idiosyncratic move",
+    ],
+    default="Mixed"
+)
+
+# Tag: momentum regime (simple + readable)
+df_view["momentum_tag"] = np.select(
+    [
+        df_view["mom_20d"] >= 0.05,
+        df_view["mom_20d"].between(-0.05, 0.05, inclusive="both"),
+        df_view["mom_20d"] <= -0.05,
+    ],
+    [
+        "Strong trend",
+        "Mixed / range",
+        "Trend breaking",
+    ],
+    default="Unknown"
+)
+
+# Signal bucket (watch / wait / avoid / action)
+df_view["signal"] = np.select(
+    [
+        # ACTION: cheap + confirmed bounce + trend not breaking
+        (df_view["residual_z"] <= -idio_z) & (df_view["retracement"] >= retr_min) & (df_view["mom_20d"] >= -0.05),
+        # WATCH: cheap-ish or good score
+        (df_view["score"] >= 1.0),
+        # AVOID: expensive vs beta OR very negative score
+        (df_view["residual_z"] >= idio_z) | (df_view["score"] <= -1.0),
+    ],
+    [
+        "ACTION",
+        "WATCH",
+        "AVOID",
+    ],
+    default="WAIT"
+)
+
 # Table
 st.markdown("### Screener table")
 show_cols = [
     "ticker","name","sector","country","px_close",
+    "signal","score","shock_tag","momentum_tag",
     "overnight_ret","overnight_z","retracement",
     "beta","residual","residual_z",
     "mom_5d","mom_20d",
@@ -360,12 +437,18 @@ ZSCORE_COLS = [
 # retracement is a ratio (0.5 = 50% gap fill). show as %
 RETRACE_COLS = ["retracement"]
 
-DECIMAL_COLS = ["beta", "px_close"]  # keep decimals (beta 2dp is fine)
+DECIMAL_COLS = ["beta", "px_close", "score"]
+
+
+#df_view = df_view.sort_values(
+#    ["flag_beta_dislocation", "residual_z"],
+#    ascending=[False, True])
 
 df_view = df_view.sort_values(
-    ["flag_beta_dislocation", "residual_z"],
-    ascending=[False, True]
+    ["signal", "score"],
+    ascending=[True, False]
 )
+
 
 import numpy as np
 
@@ -492,7 +575,10 @@ base = alt.Chart(plot_df).mark_circle(size=70, opacity=0.85).encode(
         alt.Tooltip("overnight_z:Q", format=".1f"),
         alt.Tooltip("residual_z:Q", format=".1f"),
         alt.Tooltip("retracement:Q", format=".2%"),
-        alt.Tooltip("mom_20d:Q", format=".2%")
+        alt.Tooltip("mom_20d:Q", format=".2%"),
+        "signal:N",
+        alt.Tooltip("score:Q", format=".2f"),
+
     ]
 )
 
@@ -521,7 +607,7 @@ st.altair_chart(chart, use_container_width=True)
 
 # Quick "what lost steam" view: weak momentum + negative residual z
 st.markdown("### Themes losing steam (low momentum + cheap vs beta)")
-losing = df.sort_values(["mom_20d","residual_z"], ascending=[True, True]).head(20)
+losing = df_view.sort_values(["mom_20d","residual_z"], ascending=[True, True]).head(20)
 losing_tbl = losing[show_cols].copy()
 
 fmt_losing = {
