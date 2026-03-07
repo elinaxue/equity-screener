@@ -162,10 +162,10 @@ def build_screener(
         overnight_z = (overnight_ret - on_mu) / on_sd
 
         # --- retracement (gap fill strength), only for gap-down ---
-        gap = df["open"] - prev_close
-        gap_denom = gap.abs().replace(0, np.nan)
-        retracement = (df["close"] - df["open"]) / gap_denom
-        retracement = retracement.where(gap < 0)
+        gap_down = prev_close - df["open"]
+        retracement = (df["close"] - df["open"]) / gap_down
+        retracement = retracement.where(gap_down > 0)
+        retracement = retracement.clip(-1, 2)
 
         # --- beta ---
         beta = compute_beta(ret, bench_ret, window=beta_window)
@@ -388,15 +388,39 @@ df_view["momentum_tag"] = np.select(
     default="Unknown"
 )
 
-# Signal bucket (watch / wait / avoid / action)
-df_view["signal"] = np.select(
+# ----------------------------
+# Trade direction (cheap / expensive)
+# ----------------------------
+df_view["direction"] = np.select(
     [
-        # ACTION: cheap + confirmed bounce + trend not breaking
-        (df_view["residual_z"] <= -idio_z) & (df_view["retracement"] >= retr_min) & (df_view["mom_20d"] >= -0.05),
-        # WATCH: cheap-ish or good score
+        df_view["residual_z"] <= -idio_z,      # cheap vs beta
+        df_view["residual_z"] >= idio_z,       # expensive vs beta
+        df_view["residual_z"].abs() >= 1.0,    # interesting
+    ],
+    [
+        "LONG",
+        "SHORT",
+        "WATCH",
+    ],
+    default="NEUTRAL"
+)
+
+# ----------------------------
+# Setup quality (trade readiness)
+# ----------------------------
+df_view["setup_quality"] = np.select(
+    [
+        # ACTION: strong dip-buy setup
+        (df_view["residual_z"] <= -idio_z) &
+        (df_view["retracement"] >= retr_min) &
+        (df_view["mom_20d"] >= -0.05),
+
+        # WATCH: decent setup
         (df_view["score"] >= 1.0),
-        # AVOID: expensive vs beta OR very negative score
-        (df_view["residual_z"] >= idio_z) | (df_view["score"] <= -1.0),
+
+        # AVOID: expensive or very weak
+        (df_view["residual_z"] >= idio_z) |
+        (df_view["score"] <= -1.0),
     ],
     [
         "ACTION",
@@ -406,11 +430,17 @@ df_view["signal"] = np.select(
     default="WAIT"
 )
 
+
 # Table
 st.markdown("### Screener table")
+st.caption(
+"Direction = valuation vs beta. " \
+"Setup quality = trade readiness based on retracement and momentum."
+)
+
 show_cols = [
     "ticker","name","sector","country","px_close",
-    "signal","score","shock_tag","momentum_tag",
+    "direction","setup_quality","score","shock_tag","momentum_tag",
     "overnight_ret","overnight_z","retracement",
     "beta","residual","residual_z",
     "mom_5d","mom_20d",
@@ -440,12 +470,17 @@ RETRACE_COLS = ["retracement"]
 DECIMAL_COLS = ["beta", "px_close", "score"]
 
 
-#df_view = df_view.sort_values(
-#    ["flag_beta_dislocation", "residual_z"],
-#    ascending=[False, True])
+direction_order = {
+    "LONG": 0,
+    "SHORT": 1,
+    "WATCH": 2,
+    "NEUTRAL": 3
+}
+
+df_view["direction_rank"] = df_view["direction"].map(direction_order)
 
 df_view = df_view.sort_values(
-    ["signal", "score"],
+    ["direction_rank", "score"],
     ascending=[True, False]
 )
 
@@ -555,6 +590,42 @@ st.dataframe(
 # Scatter
 import altair as alt
 
+cheap_pct = (df_view["residual_z"] < -1).mean()
+exp_pct = (df_view["residual_z"] > 1).mean()
+
+mom_pos_pct = (df_view["mom_20d"] > 0).mean()
+
+sector_stats = (
+    df_view.groupby("sector")
+    .agg(
+        avg_residual=("residual_z","mean"),
+        count=("residual_z","count")
+    )
+)
+
+sector_stats["weight"] = sector_stats["count"] / sector_stats["count"].sum()
+
+sector_stats["weighted_score"] = (
+    sector_stats["avg_residual"] * sector_stats["weight"]
+)
+
+sector_score = sector_stats["weighted_score"].sort_values()
+
+cheap_sector = sector_score.index[0]
+exp_sector = sector_score.index[-1]
+
+summary = ""
+
+if exp_pct > 0.6:
+    summary = "Most stocks screen expensive vs beta."
+elif cheap_pct > 0.6:
+    summary = "Most stocks screen cheap vs beta."
+else:
+    summary = "Market appears fairly balanced."
+
+summary += f" Cheapest sector: {cheap_sector}. Most expensive sector: {exp_sector}."
+
+
 st.markdown(
     "### Scatter: Cheap / Expensive vs Momentum  \n"
     "*x = beta-adjusted overnight mispricing (z), y = 20-day momentum*"
@@ -564,6 +635,7 @@ color_key = "sector" if df_view["sector"].notna().any() else "country"
 
 plot_df = df_view.copy()
 plot_df = plot_df.dropna(subset=["residual_z", "mom_20d"])
+
 
 base = alt.Chart(plot_df).mark_circle(size=70, opacity=0.85).encode(
     x=alt.X("residual_z:Q", title="Beta-adjusted overnight mispricing (z) ← Cheap | Expensive →"),
@@ -576,7 +648,8 @@ base = alt.Chart(plot_df).mark_circle(size=70, opacity=0.85).encode(
         alt.Tooltip("residual_z:Q", format=".1f"),
         alt.Tooltip("retracement:Q", format=".2%"),
         alt.Tooltip("mom_20d:Q", format=".2%"),
-        "signal:N",
+        "direction:N",
+        "setup_quality:N",
         alt.Tooltip("score:Q", format=".2f"),
 
     ]
@@ -604,6 +677,8 @@ txt = alt.Chart(labels).mark_text(align="left", baseline="top", dx=5, dy=-5).enc
 chart = (base + x0 + y0 + txt).properties(height=450).interactive()
 
 st.altair_chart(chart, use_container_width=True)
+
+st.markdown(f"**Market summary:** {summary}")
 
 # Quick "what lost steam" view: weak momentum + negative residual z
 st.markdown("### Themes losing steam (low momentum + cheap vs beta)")
